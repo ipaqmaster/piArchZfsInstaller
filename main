@@ -1,0 +1,359 @@
+#!/bin/bash
+
+# I recommend using a zvol on NVMe then DDing to the Pi SD card when ready. Much faster installation.
+disk=/dev/zvol/mypc/pi_image_zvol
+
+hostname=myPi4                                     # The Pi's desired hostname. This will also be the zpool name.
+rootPasswd='changeme123'                           # A root password for login
+zpool_encryption_passphrase=${rootPasswd}          # The decryption passphrase for the Pi's zpool
+buildDir=/mnt                                      # What temporary host directory should we do all of this in?
+EFISize=512M                                       # Desired size of the EFI partition. I wouldn't go below 100mb. For futureproofing.
+datasets_to_create=(/home /opt /usr /var /var/log) # Some subdirs we want to create datasets for under the root dataset of the Pi's zpool
+partitionTypes=(EF00 BF01)                         # What we will use for the EFI and zpool partition types. This gets changed later if pi3=Y. Probably best to leave alone.
+
+# (Yes/No or yes/no [Yy/Nn])
+pi3=No                      # Does this Pi get its firmware from the first MBR partition marked bootable? (For Pi3 and older, YES otherwise they won't be able to boot.)
+store_passphrase_in_boot=Y  # Let the Pi auto unlock itself by storing its decryption passphrase as a file in /boot? # Least hassle, technically insecure.
+serialOverUSB=Y             # For Pi 4 and newer, enable serial over the USB power port? /dev/ttyACM0 will appear on the host for a serial shell without initial networking.
+copy_authorized_keys=Y      # Read user's and root's authorized_keys file, id_rsa.pub and id_ed25519.pub into the Pi for passwordless first SSH login?
+
+# If you have prebuilt zfs-dkms and zfs-utils for aarch64
+# slip them into the below aarch64_pkg_cache directory below for the Pi
+# otherwise it will build them itself.
+
+# If uncommented, stores aarch64 packages to the host
+# Good for repeat installations without bothering the mirrors
+aarch64_pkg_cache=/var/cache/pacman/pkg/aarch64
+
+#  ____
+# |  _ \ _ __ ___ _ __
+# | |_) | '__/ _ \ '_ \
+# |  __/| | |  __/ |_) |
+# |_|   |_|  \___| .__/
+#                |_|
+
+_scriptPath=$(realpath $0)
+_scriptRoot="$(dirname $(realpath $0))"
+_scriptName="$(basename ${_scriptRoot})"
+cd ${_scriptRoot} || exit 1
+
+echo "Don't forget to open this script and edit your installation parameters..."
+
+if ! [ -e "${disk}" ]
+then
+  echo "This disk path doesn't seem to exist: ${disk}"
+  exit 1
+fi
+
+read -n1 -p "Do you want to continue on ${disk}? [Y/n]: " answer
+answer=${answer:-Y}
+echo
+
+if [[ "$answer" =~ ^[Yy]$ ]]
+then
+    echo "Continuing..."
+    for i in {3..1}
+    do
+    echo -ne "$i...\r"
+    sleep 1
+done
+else
+    echo "Aborted."
+    exit 1
+fi
+
+[ $UID -ne 0 ] && SUDO=sudo # Sudo if not root
+
+#  _____                 _   _
+# |  ___|   _ _ __   ___| |_(_) ___  _ __  ___
+# | |_ | | | | '_ \ / __| __| |/ _ \| '_ \/ __|
+# |  _|| |_| | | | | (__| |_| | (_) | | | \__ \
+# |_|   \__,_|_| |_|\___|\__|_|\___/|_| |_|___/
+#
+
+function do_cleanup {
+  code=$?
+  # Work around https://gitlab.archlinux.org/archlinux/arch-install-scripts/-/issues/56 so the zvol can be destroyed in testing
+  ps aux|grep [g]pg-agent| grep ${buildDir}/etc/pacman.d | awk '{print $2}' | xargs ${SUDO} kill
+
+  #mount |grep ${buildDir}| cut -d' ' -f3 | sort -Vr | xargs umount
+  exit $code
+} ; trap do_cleanup EXIT HUP INT TERM
+
+# A small function for finding device partitions for different /dev $disk paths
+# Allowing the use of /dev/sdX, /dev/nvmeXnX and /dev/disk/by- paths interchangably.
+function getDevicePartition {
+  target=${1}
+  partNumber=${2}
+
+  possiblePaths=(${target}${partNumber} ${target}-part${partNumber} ${target}p${partNumber})
+
+  for path in ${possiblePaths[*]}
+  do
+    if [ -b "${path}" ] # If path is a device file, return
+    then
+      echo -ne "${path}"
+      return 0
+    elif [ -h "${path}" ] # if realpath is a device file, continue
+    then
+      if [ -b "$(realpath "${path}")" ]
+      then
+        echo -ne "${path}"
+        return 0
+      fi
+    fi
+  done
+
+  echo "Failed to find partition ${partNumber} for ${target} ">&2
+  echo "Unknown"
+  exit 1
+}
+
+#  __  __       _
+# |  \/  | __ _(_)_ __
+# | |\/| |/ _` | | '_ \
+# | |  | | (_| | | | | |
+# |_|  |_|\__,_|_|_| |_|
+#
+
+diskReal=$(realpath "${disk}")
+
+# have sgdisk convert from GPT to MBR for the Pi3
+if [[ "$pi3" =~ [Yy] ]]
+then
+  echo "Preparing installation environment for a Pi3 (eeprom on SD, MBR required)"
+  MBRArgs='--gpttombr 1:2'
+  partitionTypes=(0700 8300)
+else
+  echo "Preparing installation environment for a Pi4 and up. (GPT + UEFI boot) [This will not work on a Pi3, see variables and re-run if you need this to work on a Pi3 !]"
+fi
+
+# Check if this disk is in use
+if grep -qE "${disk}|${diskReal}" /proc/mounts
+then
+  echo "${disk} is mounted."
+  exit 1
+elif zpool status -P 2>&1 | grep -qE "${disk}|${diskReal}"
+then
+  echo "${disk} is part of a zpool."
+  exit 1
+elif ${SUDO} lsof "${disk}" >/dev/null 2>&1
+then
+  echo "${disk} is in use by a process."
+  exit 1
+fi 
+
+
+# Create a passphrase key and protect it
+if [ ! -e "/etc/zfs/${hostname}.key" ]
+then
+  echo "${zpool_encryption_passphrase}" | ${SUDO} tee /etc/zfs/${hostname}.key >/dev/null
+else
+  echo "/etc/zfs/${hostname}.key already exists. Using existing file."
+fi
+
+# Restrict permissions on the key.
+${SUDO} chmod 000 /etc/zfs/${hostname}.key
+
+# Back up the device partition table just in case.
+${SUDO} sfdisk -d ${disk} > partitiontable.$(date +%s).bak
+
+# Create an EFI partition, and a BF01 partition of the remaining space for a zpool.
+${SUDO} sgdisk "${disk}" -o -n 1:2M:+${EFISize} -t 1:${partitionTypes[0]} -A 1:set:2 -n 2 -t 2:${partitionTypes[1]} ${MBRArgs}
+if [ -n "${MBRArgs}" ]
+then
+  ${SUDO} parted "${disk}" type 1 c set 1 boot on # gdisk does not know what type c (W95 FAT32 (LBA) is.
+fi
+
+sleep 1 # Give the system a moment to refresh its partitions
+
+# Make an EFI partition
+${SUDO} mkfs.vfat -F 32 -n EFI $(getDevicePartition ${disk} 1)
+
+# Make a zpool
+${SUDO} zpool create -f -o ashift=12 \
+ -o autoexpand=on \
+ -o autotrim=on \
+ -o compatibility=openzfs-2.1-linux \
+ -O acltype=posixacl \
+ -O canmount=noauto \
+ -O compression=lz4 \
+ -O encryption=aes-256-gcm \
+ -O keyformat=passphrase \
+ -O keylocation=file:///etc/zfs/${hostname}.key \
+ -O normalization=formD \
+ -O relatime=on \
+ -O xattr=sa \
+ -m none -R ${buildDir} "${hostname}" "$(getDevicePartition ${disk} 2)" || exit 1
+
+
+# Create a rootfs
+${SUDO} zfs create -o mountpoint=/ ${hostname}/root
+
+# Set bootfs as a hint to potential initramfs hooks
+${SUDO} zpool set bootfs=${hostname}/root ${hostname}
+
+# Create some additional datasets for organising stuff.
+for dataset in ${datasets_to_create[*]}
+do
+  ${SUDO} zfs create ${hostname}/root${dataset}
+done
+
+# Create and mount /boot
+${SUDO} mkdir ${buildDir}/boot
+${SUDO} mount $(getDevicePartition ${disk} 1) ${buildDir}/boot
+
+wget --no-clobber https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/master/archlinuxarm.gpg
+${SUDO} pacman-key --add archlinuxarm.gpg
+
+set -x
+# Sign the archlinuxarm keys
+pacman-key -l archlinuxarm | grep -Po '[A-F0-9]{40}' | \
+  while read archlinuxarmKey
+  do
+    ${SUDO} pacman-key --lsign-key ${archlinuxarmKey}
+  done
+
+
+echo '[options]
+HoldPkg     = pacman glibc
+Architecture = aarch64
+ParallelDownloads = 50
+
+CheckSpace
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[core]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[extra]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[community]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[alarm]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[aur]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+' | ${SUDO} tee ~/pacman.aarch64.conf >/dev/null
+
+if [ -n "${aarch64_pkg_cache}" ]
+then
+  ${SUDO} mkdir -p "${aarch64_pkg_cache}"
+  ${SUDO} mkdir -p "${buildDir}/var/cache/pacman/pkg"
+  ${SUDO} mount --bind "${aarch64_pkg_cache}" "${buildDir}/var/cache/pacman/pkg"
+fi
+
+${SUDO} pacstrap -M -K -C ~/pacman.aarch64.conf ${buildDir} archlinuxarm-keyring base chrony openssh raspberrypi-bootloader vim networkmanager linux-rpi linux-rpi-headers git sudo wireless-regdb rsync usbutils || exit 1
+
+# Generate fstab entries
+${SUDO} genfstab -U ${buildDir} | grep -iEv 'cache|swap' | ${SUDO} tee -a ${buildDir}/etc/fstab >/dev/null
+
+# Prepare the host to chroot in
+${SUDO} pacman --needed --noconfirm -S qemu-user-static-binfmt qemu-user-static
+
+${SUDO} cp /usr/lib/binfmt.d/qemu-aarch64-static.conf /etc/binfmt.d/
+
+${SUDO} cp $(which qemu-aarch64-static) ${buildDir}/usr/bin
+
+# Chroot in for a number of things
+${SUDO} arch-chroot ${buildDir} /sbin/systemctl enable NetworkManager sshd chronyd
+yes ${rootPasswd} | ${SUDO} arch-chroot ${buildDir} /bin/passwd root
+echo ${hostname} | ${SUDO} tee -a ${buildDir}/etc/hostname >/dev/null
+${SUDO} sed -i "s/root=\/dev\/mmcblk0p2/zfs=${hostname}\/root/g" ${buildDir}/boot/cmdline.txt
+${SUDO} cp /etc/locale.conf ${buildDir}/etc/locale.conf
+${SUDO} cp /etc/locale.gen ${buildDir}/etc/locale.gen
+${SUDO} arch-chroot ${buildDir} locale-gen
+#arch-chroot ${buildDir} /bin/bash
+
+# Append any SSH keys on the host for ssh access to the Pi on boot
+if [[ "$copy_authorized_keys" =~ ^[Yy]$ ]]
+then
+  potentialSshKeys=(${HOME}/.ssh/authorized_keys ${SUDO_HOME}/.ssh/authorized_keys ${HOME}/.ssh/id_rsa.pub ${SUDO_HOME}/.ssh/id_ed25519.pub)
+  for keyPath in ${potentialSshKeys[*]}
+  do
+    if [ -f "${keyPath}" ]
+    then
+      echo "Appending ${keyPath} to ${buildDir}/root/.ssh/authorized_keys"
+      cat ${keyPath} | ${SUDO} tee -a ${buildDir}/root/.ssh/authorized_keys >/dev/null
+    fi
+  done
+else
+  echo "Not copying SSH keys to the installation as requested by variable."
+fi
+
+# If we end up building, we want to take advantage of all cores.
+echo 'MAKEFLAGS="--jobs=$(nproc)"' | ${SUDO} tee -a ${buildDir}/etc/makepkg.conf >/dev/null
+
+#if [ -d ~/aarch64-usr-src ]
+#then
+#  echo "Copying in existing aarch64-usr-src from host..."
+#  ${SUDO} rsync -avrP --links ~/aarch64-usr-src/* ${buildDir}/usr/src/
+#fi
+
+# Try and install the module if we have built it for this kernel version before
+#if [ -d /var/lib/dkms/zfs ]
+#then
+#  latestVersion=$(basename $(find /var/lib/dkms/zfs -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort -V | tail -n1))
+#  echo "Attempting to dkms-add pre-built zfs modules."
+#  ${SUDO} arch-chroot "${buildDir}" pacman --noconfirm -S dkms
+#  ${SUDO} arch-chroot "${buildDir}" dkms add -m zfs/${latestVersion} #-v $(arch-chroot "${buildDir}" pacman -Q linux| cut -d ' ' -f2)
+#fi
+
+
+# If we've made and saved these dkms modules before, reuse them to avoid a slow rebuild.
+latest_aarch64_dkms_local="$(ls -1 ${HOME}/aarch64.*.dkms.tar.gz | sort -V | tail -n1)"
+if [ -n "${latest_aarch64_dkms_local}" ]
+then
+  latest_aarch64_dkms_local_filename="$(basename "${latest_aarch64_dkms_local}")"
+
+  echo "Copying in and extracting existing aarch64 dkms build from host..."
+  #${SUDO} rsync -avrP --links ~/aarch64-var-lib-dkms/* ${buildDir}/var/lib/dkms/
+  ${SUDO} cp -v "${latest_aarch64_dkms_local}" "${buildDir}/${latest_aarch64_dkms_local_filename}"
+  ${SUDO} arch-chroot ${buildDir} bash -c "tar xvf /${latest_aarch64_dkms_local_filename}"
+fi
+
+if not ${SUDO} arch-chroot ${buildDir} /bin/bash -c 'pacman --noconfirm -U /var/cache/pacman/pkg/zfs-{dkms,utils}*.xz'
+then
+  echo "Building zfs-utils and zfs-dkms manually for this aarch64 host."
+  ${SUDO} arch-chroot ${buildDir} /usr/bin/useradd -m build
+  #echo 'build  ALL=(ALL) NOPASSWD: pacman *' | ${SUDO} tee -a ${buildDir}/etc/sudoers.d/build >/dev/null # Let 'build' install dependency packages
+
+  # Install prereqs
+  ${SUDO} arch-chroot ${buildDir} /usr/bin/pacman --noconfirm --needed -S fakeroot patch autoconf automake libtool base-devel
+
+  # Build zfs-utils
+  ${SUDO} arch-chroot -u build:build ${buildDir} /usr/bin/git -C /home/build/ clone https://aur.archlinux.org/zfs-utils.git
+  ${SUDO} PKGDEST=/home/build HOME=/home/build arch-chroot -u build:build ${buildDir} /usr/bin/bash -l -c 'cd /home/build/zfs-utils ; source PKGBUILD ; for key in ${validpgpkeys[*]} ; do gpg --recv-key ${key}; done ; /usr/bin/makepkg'
+
+  # Build zfs-dkms
+  ${SUDO} arch-chroot -u build:build ${buildDir} /usr/bin/git -C /home/build/ clone https://aur.archlinux.org/zfs-dkms.git
+  ${SUDO} PKGDEST=/home/build HOME=/home/build arch-chroot -u build:build ${buildDir} /usr/bin/bash -l -c 'cd /home/build/zfs-dkms ; source PKGBUILD ; for key in ${validpgpkeys[*]} ; do gpg --recv-key ${key}; done ; /usr/bin/makepkg'
+
+  # Move both
+  ${SUDO} arch-chroot ${buildDir} /bin/bash -l -c 'mv -nv /home/build/*.xz /var/cache/pacman/pkg/'
+
+  # Install zfs-dkms and zfs-utils but skip the DKMS build.
+  #DKMS_SKIP_BUILD=1 ${SUDO} arch-chroot ${buildDir} /bin/bash -l -c 'pacman -U --noconfirm /var/cache/pacman/pkg/{zfs-utils,zfs-dkms}*.xz'
+  # Install zfs-dkms and zfs-utils
+  ${SUDO} arch-chroot ${buildDir} /bin/bash -l -c 'pacman -U --noconfirm /var/cache/pacman/pkg/{zfs-utils,zfs-dkms}*.xz'
+fi
+
+echo "Syncing host copies of aarch64 dkms modules"
+${SUDO} arch-chroot ${buildDir} bash -c "tar zcvf /aarch64.dkms.tar.gz /var/lib/dkms/zfs /usr/lib/modules/*/updates/dkms/*"
+piKernel="$(find ${buildDir}/usr/lib/modules/ -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n1)"
+cp -v ${buildDir}/aarch64.dkms.tar.gz ${HOME}/aarch64.${piKernel}.dkms.tar.gz
+
+# Add the ZFS hook and rebuild the initramfs
+${SUDO} cp -v /etc/zfs/${hostname}.key ${buildDir}/etc/zfs/
+${SUDO} sed -i "s/^FILES=()/FILES=(\/etc\/zfs\/${hostname}.key)/g" ${buildDir}/etc/mkinitcpio.conf
+LINE="$(grep ^HOOKS ${buildDir}/etc/mkinitcpio.conf)"
+${SUDO} sed -i "s/${LINE}/${LINE/)/ zfs)}/g" ${buildDir}/etc/mkinitcpio.conf
+${SUDO} arch-chroot ${buildDir} /usr/bin/mkinitcpio -P
+
+if [[ "$pi3" =~ [Nn] ]]
+then
+  # Serial over USB support for Pi 4 via /dev/ttyACM0 on the host when a data USB cable is used.
+  echo -e 'dwc2\ng_serial' | ${SUDO} tee ${buildDir}/etc/modules-load.d/usb-c_serial.conf >/dev/null
+  echo -e '\ndtoverlay=dwc2' | ${SUDO} tee -a ${buildDir}/boot/config.txt >/dev/null
+  ${SUDO} arch-chroot ${buildDir} systemctl enable getty@ttyGS0.service
+fi
