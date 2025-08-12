@@ -37,11 +37,11 @@ _scriptRoot="$(dirname $(realpath $0))"
 _scriptName="$(basename ${_scriptRoot})"
 cd ${_scriptRoot} || exit 1
 
-echo "Don't forget to open this script and edit your installation parameters..."
+echo "Don't forget to open this script and edit your installation parameters..." >&2
 
 if ! [ -e "${disk}" ]
 then
-  echo "This disk path doesn't seem to exist: ${disk}"
+  echo "This disk path doesn't seem to exist: ${disk}" >&2
   exit 1
 fi
 
@@ -51,18 +51,24 @@ echo
 
 if [[ "$answer" =~ ^[Yy]$ ]]
 then
-    echo "Continuing..."
+    echo "Continuing..." >&2
     for i in {3..1}
     do
-    echo -ne "$i...\r"
+    echo -ne "$i...\r" >&2
     sleep 1
 done
 else
-    echo "Aborted."
+    echo "Aborted." >&2
     exit 1
 fi
 
 [ $UID -ne 0 ] && SUDO=sudo # Sudo if not root
+
+if ! type zpool
+then
+  echo "ZFS doesn't seem to be installed on this host." >&2
+  exit 1
+fi
 
 #  _____                 _   _
 # |  ___|   _ _ __   ___| |_(_) ___  _ __  ___
@@ -104,8 +110,7 @@ function getDevicePartition {
     fi
   done
 
-  echo "Failed to find partition ${partNumber} for ${target} ">&2
-  echo "Unknown"
+  echo "Failed to find partition ${partNumber} for ${target} " >&2
   exit 1
 }
 
@@ -121,25 +126,25 @@ diskReal=$(realpath "${disk}")
 # have sgdisk convert from GPT to MBR for the Pi3
 if [[ "$pi3" =~ [Yy] ]]
 then
-  echo "Preparing installation environment for a Pi3 (eeprom on SD, MBR required)"
+  echo "Preparing installation environment for a Pi3 (eeprom on SD, MBR required)" >&2
   MBRArgs='--gpttombr 1:2'
   partitionTypes=(0700 8300)
 else
-  echo "Preparing installation environment for a Pi4 and up. (GPT + UEFI boot) [This will not work on a Pi3, see variables and re-run if you need this to work on a Pi3 !]"
+  echo "Preparing installation environment for a Pi4 and up. (GPT + UEFI boot) [This will not work on a Pi3, see variables and re-run if you need this to work on a Pi3 !]" >&2
 fi
 
 # Check if this disk is in use
 if grep -qE "${disk}|${diskReal}" /proc/mounts
 then
-  echo "${disk} is mounted."
+  echo "${disk} is mounted." >&2
   exit 1
 elif zpool status -P 2>&1 | grep -qE "${disk}|${diskReal}"
 then
-  echo "${disk} is part of a zpool."
+  echo "${disk} is part of a zpool." >&2
   exit 1
 elif ${SUDO} lsof "${disk}" >/dev/null 2>&1
 then
-  echo "${disk} is in use by a process."
+  echo "${disk} is in use by a process." >&2
   exit 1
 fi 
 
@@ -273,12 +278,12 @@ then
   do
     if [ -f "${keyPath}" ]
     then
-      echo "Appending ${keyPath} to ${buildDir}/root/.ssh/authorized_keys"
+      echo "Appending ${keyPath} to ${buildDir}/root/.ssh/authorized_keys" >&2
       cat ${keyPath} | ${SUDO} tee -a ${buildDir}/root/.ssh/authorized_keys >/dev/null
     fi
   done
 else
-  echo "Not copying SSH keys to the installation as requested by variable."
+  echo "Not copying SSH keys to the installation as requested by variable." >&2
 fi
 
 # If we end up building, we want to take advantage of all cores.
@@ -306,7 +311,7 @@ if [ -n "${latest_aarch64_dkms_local}" ]
 then
   latest_aarch64_dkms_local_filename="$(basename "${latest_aarch64_dkms_local}")"
 
-  echo "Copying in and extracting existing aarch64 dkms build from host..."
+  echo "Copying in and extracting existing aarch64 dkms build from host..." >&2
   #${SUDO} rsync -avrP --links ~/aarch64-var-lib-dkms/* ${buildDir}/var/lib/dkms/
   ${SUDO} cp -v "${latest_aarch64_dkms_local}" "${buildDir}/${latest_aarch64_dkms_local_filename}"
   ${SUDO} arch-chroot ${buildDir} bash -c "tar xvf /${latest_aarch64_dkms_local_filename}"
@@ -314,7 +319,7 @@ fi
 
 if not ${SUDO} arch-chroot ${buildDir} /bin/bash -c 'pacman --noconfirm -U /var/cache/pacman/pkg/zfs-{dkms,utils}*.xz'
 then
-  echo "Building zfs-utils and zfs-dkms manually for this aarch64 host."
+  echo "Building zfs-utils and zfs-dkms manually for this aarch64 host." >&2
   ${SUDO} arch-chroot ${buildDir} /usr/bin/useradd -m build
   #echo 'build  ALL=(ALL) NOPASSWD: pacman *' | ${SUDO} tee -a ${buildDir}/etc/sudoers.d/build >/dev/null # Let 'build' install dependency packages
 
@@ -338,7 +343,7 @@ then
   ${SUDO} arch-chroot ${buildDir} /bin/bash -l -c 'pacman -U --noconfirm /var/cache/pacman/pkg/{zfs-utils,zfs-dkms}*.xz'
 fi
 
-echo "Syncing host copies of aarch64 dkms modules"
+echo "Syncing host copies of aarch64 dkms modules" >&2
 ${SUDO} arch-chroot ${buildDir} bash -c "tar zcvf /aarch64.dkms.tar.gz /var/lib/dkms/zfs /usr/lib/modules/*/updates/dkms/*"
 piKernel="$(find ${buildDir}/usr/lib/modules/ -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n1)"
 cp -v ${buildDir}/aarch64.dkms.tar.gz ${HOME}/aarch64.${piKernel}.dkms.tar.gz
